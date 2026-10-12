@@ -1,0 +1,8 @@
+# data, outputs, QA images and secrets never go to git
+data/
+out/
+qa/
+*.json
+*.zip
+__pycache__/
+.ipynb_checkpoints/
