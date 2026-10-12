@@ -42,6 +42,7 @@ from shapely import affinity
 from shapely.geometry import box
 
 GAP_CLOSE_M = 6.0  # closes CropScan gaps up to ~12 m wide (roads, bunds)
+QUAD_SEGS = 16  # segments per quarter circle in the gap-closing buffers
 HOLE_FILL_HA = 0.02  # only CropScan specks / noise holes (< 200 m2) are filled
 BIG_HA = 5.0  # eSurvey polygons this big are blocks of many fields
 DROP_BELOW = 0.0  # no coverage cut-off: any eSurvey with a real CropScan field is cut and kept
@@ -71,12 +72,19 @@ MIN_PART_HA = 0.01  # output pieces smaller than this are removed
 
 
 def fill_small_holes(geom, max_area):
+    filled = False
+
     def fix(p):
+        nonlocal filled
         holes = [r for r in p.interiors if shapely.Polygon(r).area >= max_area]
+        filled |= len(holes) < len(p.interiors)
         return shapely.Polygon(p.exterior, holes)
 
-    parts = shapely.get_parts(geom)
-    return shapely.union_all([fix(p) for p in parts if p.geom_type == "Polygon"])
+    parts = [fix(p) for p in shapely.get_parts(geom) if p.geom_type == "Polygon"]
+    if not parts:
+        return shapely.Polygon()
+    # the parts are disjoint unless a filled hole had another part inside it
+    return shapely.union_all(parts) if filled else shapely.multipolygons(parts)
 
 
 def dominant_angle(poly):
@@ -104,7 +112,7 @@ def field_like(g):
 
 def drop_islands(geom, min_area):
     parts = [g for g in shapely.get_parts(geom) if g.area >= min_area]
-    return shapely.union_all(parts) if parts else shapely.Polygon()
+    return shapely.multipolygons(parts) if parts else shapely.Polygon()
 
 
 def straight_cut(poly, cs_local):
@@ -176,20 +184,29 @@ def _esurvey_job_one(i, snap=False):
     near = _CS_TREE.query(win, predicate="intersects")
     if not len(near):
         return rows
-    local = fill_small_holes(shapely.union_all(shapely.intersection(_snap(_CS[near], snap), win)), HOLE_FILL_HA * 1e4)
-    ci = g.intersection(local.buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M))  # road / bund gaps bridged
+    pieces = shapely.intersection(_snap(_CS[near], snap), win)
+    local = fill_small_holes(shapely.union_all(pieces), HOLE_FILL_HA * 1e4)
+    close = lambda x: x.buffer(GAP_CLOSE_M, quad_segs=QUAD_SEGS).buffer(-GAP_CLOSE_M, quad_segs=QUAD_SEGS)
+    ci = g.intersection(close(local))  # road / bund gaps bridged
     cv = ci.area / g.area
     if cv <= DROP_BELOW:
         return rows
     if g.area >= BIG_HA * 1e4:  # blocks of many fields: lone CropScan specks do not keep a field
-        ci = g.intersection(drop_islands(local, ISLAND_HA * 1e4).buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M))
+        kept = drop_islands(local, ISLAND_HA * 1e4)
+        if shapely.get_num_geometries(kept) < shapely.get_num_geometries(local):  # only when there are specks
+            ci = g.intersection(close(kept))
     cut = None if ci.is_empty else straight_cut(g, ci)
     if cut is None or cut.is_empty:
         return rows
     if g.area - cut.area < NOISE_HA * 1e4:  # nothing cut -> original boundary
-        rows.append((g, "esurvey", cv, i))
+        src, cut = "esurvey", g
     else:
-        rows.append((cut, "esurvey_clipped", cv, i))
+        src = "esurvey_clipped"
+    tree = shapely.STRtree(pieces)
+    for part in shapely.get_parts(cut):  # each part gets the CropScan polygon it overlaps most
+        hit = tree.query(part, predicate="intersects")
+        best = near[hit[np.argmax(shapely.area(shapely.intersection(pieces[hit], part)))]] if len(hit) else -1
+        rows.append((part, src, cv, i, best))
     return rows
 
 
@@ -204,14 +221,14 @@ def _cropscan_job_one(i, snap=False):
     g = _snap(_CS[i], snap) if snap else _CS[i]
     near = _ES_TREE.query(g, predicate="intersects")
     if not len(near):
-        rows.append((g, "cropscan", i))
+        rows.append((g, "cropscan", i, i))
         return rows
     spill = g.difference(shapely.union_all(_snap(_ES[near], snap)))
     # square-cornered opening: thin strips go, field corners stay as CropScan drew them
     spill = spill.buffer(-SPILL_OPEN_M, join_style="mitre").buffer(SPILL_OPEN_M, join_style="mitre").intersection(spill)
     for part in shapely.get_parts(spill):
         if part.geom_type == "Polygon" and part.area >= SPILL_MIN_HA * 1e4 and field_like(part):
-            rows.append((fill_small_holes(part, HOLE_FILL_HA * 1e4), "cropscan_spill", i))
+            rows.append((fill_small_holes(part, HOLE_FILL_HA * 1e4), "cropscan_spill", i, i))
     return rows
 
 
@@ -253,32 +270,25 @@ def main():
     ctx = multiprocessing.get_context("fork")
     out = []
     with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
-        order = np.argsort(-shapely.area(_ES))  # biggest first, for even load
-        for rows in pool.map(_esurvey_job, np.array_split(order, workers * 16)):
-            out += [(g, src, cv, es.index[i], -1) for g, src, cv, i in rows]
+        # biggest polygons first, handed out a few at a time, so no worker is left with all the big ones
+        order = np.argsort(-shapely.area(_ES))
+        for rows in pool.map(_esurvey_job, [order[k:k + 4] for k in range(0, len(order), 4)]):
+            out += [(g, src, cv, es.index[i], cs.index[c] if c >= 0 else -1) for g, src, cv, i, c in rows]
         print(f"esurvey decided  {time.time() - t0:.1f}s")
-        for rows in pool.map(_cropscan_job, np.array_split(np.arange(len(_CS)), workers * 16)):
-            out += [(g, src, np.nan, -1, cs.index[i] if src == "cropscan" else -1) for g, src, i in rows]
+        order = np.argsort(-shapely.get_num_coordinates(_CS))
+        for rows in pool.map(_cropscan_job, [order[k:k + 16] for k in range(0, len(order), 16)]):
+            out += [(g, src, np.nan, -1, cs.index[c]) for g, src, i, c in rows]
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
-    res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id", "orig_cs"], crs=crs)
+    res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id", "cs_id"], crs=crs)
     res = res.explode(index_parts=False)
     res = res[res.geom_type == "Polygon"]
     if aoi is not None:
         res = res[res.intersects(aoi)]
     # untouched CropScan is never filtered; new pieces below MIN_PART_HA are dropped
     res = res[(res.source == "cropscan") | (res.area >= MIN_PART_HA * 1e4)].reset_index(drop=True)
-    # cs_id: the CropScan polygon that overlaps each output polygon most (-1 if none)
-    cs_ids = cs.index.to_numpy()  # ids can repeat in a subset (one polygon cut into parts)
-    cs_pos = cs.reset_index(drop=True)
-    pairs = gpd.sjoin(res[["geometry"]], cs_pos[["geometry"]], predicate="intersects").reset_index()
-    pairs["ov"] = shapely.area(shapely.intersection(res.geometry.values[pairs["index"]], cs_pos.geometry.values[pairs.index_right]))
-    best = pairs.sort_values("ov").drop_duplicates("index", keep="last").set_index("index").index_right
-    res["cs_id"] = -1
-    res.loc[best.index, "cs_id"] = cs_ids[best.to_numpy()]
     res.insert(0, "fid", np.arange(1, len(res) + 1))
     res.insert(1, "predicted", 1)  # Sugarcane
-    res.loc[res.source == "cropscan", "cs_id"] = res.orig_cs[res.source == "cropscan"]
     res["es_cover"] = res.es_cover.round(3)
     res["area_ac"] = (res.area / M2_PER_ACRE).round(3)
     # review flag: small or narrow CropScan pieces left beside eSurvey after the clip
@@ -289,7 +299,7 @@ def main():
     for upper, name in SMALL_CLASSES[::-1]:
         cat = cat.where(~(spill & (res.area_ac < upper)), name)
     res["category"] = cat
-    res = res.drop(columns="orig_cs")
+    print(f"attributes  {time.time() - t0:.1f}s")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     res.to_parquet(os.path.splitext(a.out)[0] + ".parquet")
@@ -301,6 +311,7 @@ def main():
         same = np.isclose(orig.to_crs(crs).area.to_numpy(), res.area[keep].to_numpy(), rtol=1e-6)
         out4326.loc[keep[same], "geometry"] = orig.geometry.values[same]  # parts cut by an AOI stay cut
         print(f"original geometry restored for {same.sum()} of {len(keep)} untouched CropScan polygons")
+    print(f"originals restored  {time.time() - t0:.1f}s")
     out4326.to_file(a.out, driver="GPKG", engine="pyogrio")
     print(res.groupby("source").area_ac.agg(["count", "sum"]).round(1))
     print(res.groupby("category").area_ac.agg(["count", "sum"]).round(1))

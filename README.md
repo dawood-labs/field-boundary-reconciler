@@ -27,8 +27,11 @@ Output fields: `fid`, `predicted` (1 = Sugarcane), `source`, `category`,
 pip install -r requirements.txt
 ```
 
-Python 3.11, any machine. The merge uses every core; memory stays below
-~3 GB for ~24,000 CropScan and ~10,000 eSurvey polygons.
+Python 3.11, any machine. The merge uses every core (`--workers` to limit it).
+Each eSurvey and CropScan polygon is processed in its own small window, so time
+and memory grow linearly with the area. Reference run, 8 cores: ~24,000
+CropScan polygons (27 million vertices) and ~10,000 eSurvey polygons in about
+3 minutes, peak memory 1.7 GB.
 
 ## Steps
 
