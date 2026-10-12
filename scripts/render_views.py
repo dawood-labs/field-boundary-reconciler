@@ -36,9 +36,19 @@ SESSION = requests.Session()
 SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=32))
 
 
+TILE_DIR = "data/tiles"  # disk cache written by cache_tiles.py
+
+
 def tile(x, y, z):
+    path = os.path.join(TILE_DIR, str(z), str(x), f"{y}.jpg")
+    if os.path.exists(path):
+        return Image.open(path).convert("RGB")
     r = SESSION.get(TILE_URL.format(s=(x + y) % 4, x=x, y=y, z=z), timeout=30)
     r.raise_for_status()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".part", "wb") as f:
+        f.write(r.content)
+    os.replace(path + ".part", path)
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 
@@ -70,7 +80,9 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--layer", action="append", required=True, help="name=path.parquet[?col=value]:color")
     p.add_argument("--zoom", type=int, default=18)
+    p.add_argument("--tiles", default=TILE_DIR, help="tile cache folder")
     a = p.parse_args()
+    globals()["TILE_DIR"] = a.tiles
     os.makedirs(a.out, exist_ok=True)
 
     layers = []

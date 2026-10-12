@@ -44,10 +44,10 @@ EDGE_M = 8.0  # CropScan sits a few metres inside field edges -> grown by this b
 CUT_MIN_CELLS = 2  # a part is cut off only if it is at least this many cells (20 m) wide ...
 CUT_MIN_HA = 0.1  # ... and at least this big: any whole field without CropScan is cut, small or big
 ISLAND_HA = 0.15  # in big blocks, lone CropScan bits smaller than this do not keep a field
-SPILL_OPEN_M = 15.0  # spills narrower than ~30 m are cut off
-SPILL_MIN_HA = 0.2  # smaller spills are cut off
-SPILL_MIN_WIDTH_M = 30.0  # spills narrower than this (rotated box) are cut off
-SPILL_RECT_MIN = 0.65  # spills filling less of their rotated box (wedges, blobs) are cut off
+SPILL_OPEN_M = 7.5  # spills narrower than ~15 m (edge misalignment strips) are cut off
+SPILL_MIN_HA = 0.05  # smaller spills are cut off; anything bigger and wide enough is a field and kept
+SPILL_MIN_WIDTH_M = 15.0  # spills narrower than this (rotated box) are cut off
+SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
 MIN_PART_HA = 0.05  # output pieces smaller than this are removed
 
 
