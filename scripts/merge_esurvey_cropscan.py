@@ -34,6 +34,7 @@ import time
 
 import geopandas as gpd
 import numpy as np
+import pyarrow.parquet as pq
 import pyogrio
 import pandas as pd
 import rasterio.features as rf
@@ -237,17 +238,40 @@ def _cropscan_job_one(i, snap=False):
     return rows
 
 
+ORIG_ID = "fid"  # index column of cropscan_original.parquet
 ES_GROUP = 500  # eSurvey polygons per saved group
 CS_GROUP = 4000  # CropScan polygons per saved group
 
 
 def run_key(paths):
-    """Fingerprint of the inputs and this script; saved groups are reused only while it is unchanged."""
+    """Fingerprint of the inputs and of this script's cutting logic (the code above the post-processing
+    marker); saved groups are reused only while it is unchanged."""
     h = hashlib.sha1()
     for path in paths:
-        st = os.stat(path)
-        h.update(f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}".encode())
+        if os.path.abspath(path) == os.path.abspath(__file__):
+            with open(path) as f:
+                h.update(f.read().split(POST_MARKER)[0].encode())
+        else:
+            st = os.stat(path)
+            h.update(f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}".encode())
     return h.hexdigest()
+
+
+def read_originals(path, ids):
+    """Rows `ids` of cropscan_original.parquet, read row group by row group (low memory)."""
+    f = pq.ParquetFile(path)
+    want = set(int(i) for i in ids)
+    got_ids, got_wkb = [], []
+    for k in range(f.num_row_groups):
+        fid = f.read_row_group(k, columns=[ORIG_ID]).column(0).to_numpy()
+        hit = np.flatnonzero(np.isin(fid, list(want)))
+        if len(hit):
+            geom = f.read_row_group(k, columns=["geometry"]).column(0).take(hit).to_pylist()
+            got_ids += fid[hit].tolist()
+            got_wkb += geom
+    crs = gpd.read_parquet(path, filters=[(ORIG_ID, "in", [got_ids[0]])]).crs if got_ids else None
+    orig = gpd.GeoSeries(shapely.from_wkb(got_wkb), index=got_ids, crs=crs)
+    return orig.loc[list(ids)]
 
 
 def open_parts(parts):
@@ -274,6 +298,9 @@ def checkpoint(parts, name, compute):
     rows = compute()
     atomic_write(path, pickle.dumps(rows, protocol=5))
     return rows
+
+
+POST_MARKER = "# ---- post-processing: changes below do not invalidate saved groups ----"
 
 
 def main():
@@ -344,6 +371,7 @@ def main():
             out += [(g, src, np.nan, -1, cs.index[c]) for g, src, i, c in rows]
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
+    # ---- post-processing: changes below do not invalidate saved groups ----
     res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id", "cs_id"], crs=crs)
     res = res.explode(index_parts=False)
     res = res[res.geom_type == "Polygon"]
@@ -372,6 +400,12 @@ def main():
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     out4326 = res.to_crs(4326)
+    bad = ~out4326.is_valid  # reprojection can leave a rare self-touching ring on a newly cut piece
+    if bad.any():
+        fixed = shapely.make_valid(out4326.geometry.values[bad.to_numpy()])
+        out4326.loc[bad, "geometry"] = [max(shapely.get_parts(g), key=shapely.area) if g.geom_type != "Polygon"
+                                        else g for g in fixed]
+        print(f"repaired {bad.sum()} pieces after reprojection")
     if a.cropscan_original:  # untouched CropScan: the exact original geometry, every vertex as delivered
         keep = out4326.index[out4326.source == "cropscan"]
         # only polygons that are still whole (same area as the CropScan polygon) get the original geometry
@@ -380,10 +414,10 @@ def main():
         keep = keep[whole]
         ids = out4326.cs_id[keep].to_numpy()
         if a.cropscan_original.endswith(".parquet"):  # written by prepare_inputs.py, indexed by feature id
-            orig = gpd.read_parquet(a.cropscan_original).loc[ids]
+            orig = read_originals(a.cropscan_original, ids)
         else:  # the original shapefile itself (slow for many polygons)
             orig = pyogrio.read_dataframe(a.cropscan_original, fids=ids, columns=[])
-        out4326.loc[keep, "geometry"] = orig.geometry.values
+        out4326.loc[keep, "geometry"] = getattr(orig, "geometry", orig).values
         print(f"original geometry restored for {len(keep)} CropScan polygons kept whole")
     print(f"originals restored  {time.time() - t0:.1f}s")
     # delivery file: GeoParquet, EPSG:4326 (fast to write and read; QGIS opens it directly)

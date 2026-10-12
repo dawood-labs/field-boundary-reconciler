@@ -23,7 +23,11 @@ import os
 import time
 
 import geopandas as gpd
+import pandas as pd
 import shapely
+
+
+CHUNK = 2000  # polygons projected at a time
 
 
 def in_aoi(g, aoi):
@@ -33,7 +37,7 @@ def in_aoi(g, aoi):
 
 
 def save(g, path):
-    g.to_parquet(path + ".tmp")
+    g.to_parquet(path + ".tmp", row_group_size=2000)  # small row groups: a few rows can be read cheaply
     os.replace(path + ".tmp", path)
 
 
@@ -68,8 +72,12 @@ def main():
         cs = in_aoi(cs, aoi)
         utm = cs.estimate_utm_crs()
         # the original geometry, unchanged (same coordinates and vertices), for the delivery file
-        save(cs[["geometry"]], os.path.join(a.out, "cropscan_original.parquet"))
-        save(cs[["geometry"]].to_crs(utm), cs_path)
+        orig_path = os.path.join(a.out, "cropscan_original.parquet")
+        if not os.path.exists(orig_path):
+            save(cs[["geometry"]], orig_path)
+        # projected in chunks, so memory stays small even for very large areas
+        geoms = [cs.geometry.iloc[k:k + CHUNK].to_crs(utm) for k in range(0, len(cs), CHUNK)]
+        save(gpd.GeoDataFrame(geometry=pd.concat(geoms), crs=utm), cs_path)
         print(f"cropscan: {len(cs)} polygons -> {utm.to_string()}  {time.time() - t0:.0f}s")
 
     if os.path.exists(es_path):
