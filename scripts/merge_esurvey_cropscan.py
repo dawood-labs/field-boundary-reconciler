@@ -40,9 +40,8 @@ DROP_BELOW = 0.05  # eSurvey coverage below this -> drop
 PIX = 2.5  # pixel size (m) for the cut grid
 CELL = 2  # pixels per cell -> 5 m cells
 CELL_KEEP = 0.5  # cell coverage to keep a cell
-EDGE_M = 8.0  # CropScan sits a few metres inside field edges -> grown by this before cutting
-CUT_MIN_CELLS = 3  # a part is cut off only if it is at least this many cells (15 m) wide ...
-CUT_MIN_HA = 0.03  # ... and at least this big: any empty field, small or big, inside or on the side
+TOL_CELLS = 1  # eSurvey kept up to this many cells (5 m) from CropScan
+NOISE_HA = 0.01  # empty specks smaller than this are not cut
 ISLAND_HA = 0.15  # in big blocks, lone CropScan bits smaller than this do not keep a field
 SPILL_OPEN_M = 7.5  # spills narrower than ~15 m (edge misalignment strips) are cut off
 SPILL_MIN_HA = 0.05  # smaller spills are cut off; anything bigger and wide enough is a field and kept
@@ -88,16 +87,14 @@ def drop_islands(geom, min_area):
     return shapely.union_all(parts) if parts else shapely.Polygon()
 
 
-def straight_cut(poly, cs_local, cs_grown):
+def straight_cut(poly, cs_local):
     """Part of poly that holds CropScan, cut with straight lines along the field directions.
 
-    Empty parts are found with cs_grown (CropScan grown over the edge gap), then the cut
-    is moved out to the real CropScan edge (cs_local)."""
+    The eSurvey outline is kept where CropScan comes within TOL_CELLS of it."""
     theta = dominant_angle(poly)
     c = poly.centroid
     rp = affinity.rotate(poly, -theta, origin=c)
     rc = affinity.rotate(cs_local, -theta, origin=c)
-    rg = affinity.rotate(cs_grown, -theta, origin=c)
     x0, y0, x1, y1 = rp.bounds
     step = PIX * CELL
     w = int(np.ceil((x1 - x0) / step)) * CELL
@@ -109,20 +106,20 @@ def straight_cut(poly, cs_local, cs_grown):
     inside = cell(pm)
     poly_cells = inside > 0
     cov = lambda m: np.where(poly_cells, cell(pm & m) / np.maximum(inside, 1), 0)
-    raw_empty = poly_cells & (cov(burn(rc)) < CELL_KEEP)
-    keep = cov(burn(rg)) >= CELL_KEEP
-    # empty parts are cut off only when they are field-sized: wide enough and big enough
-    empty = poly_cells & ~keep
-    empty = ndimage.binary_opening(empty, np.ones((CUT_MIN_CELLS, CUT_MIN_CELLS)))
-    lab, n = ndimage.label(empty)
+    keep = cov(burn(rc)) >= CELL_KEEP  # cells with real CropScan
+    # tolerance: road / bund gaps up to 10 m between two CropScan fields are kept, and the eSurvey
+    # outline is kept where CropScan is within TOL_CELLS (5 m) of it; inner cuts follow CropScan
+    k = np.ones((2 * TOL_CELLS + 1,) * 2)
+    near_cs = ndimage.binary_dilation(keep, k)
+    keep = ndimage.binary_closing(np.pad(keep, TOL_CELLS + 1), k)[TOL_CELLS + 1:-TOL_CELLS - 1, TOL_CELLS + 1:-TOL_CELLS - 1]
+    rim = poly_cells & ndimage.binary_dilation(~poly_cells, k)  # cells along the eSurvey outline
+    keep = (keep | (rim & near_cs)) & poly_cells  # the outline is kept where CropScan is a few metres off it
+    # tiny empty specks (< NOISE_HA) are not cut
+    lab, n = ndimage.label(poly_cells & ~keep)
     if n:
-        sizes = ndimage.sum(empty, lab, range(1, n + 1)) * step * step / 1e4
-        empty = np.isin(lab, 1 + np.flatnonzero(sizes >= CUT_MIN_HA))
-    empty |= ndimage.binary_dilation(empty, np.ones((3, 3)), iterations=1) & raw_empty  # cut at the real edge
-    keep = poly_cells & ~empty
-    keep = ndimage.binary_closing(np.pad(keep, 3), np.ones((3, 3)))[3:-3, 3:-3] & poly_cells  # fill notches up to 15 m
-    keep = ndimage.binary_opening(keep, np.ones((CUT_MIN_CELLS, CUT_MIN_CELLS)))  # no thin leftovers
-    # empty fields inside a block are cut out too (as holes); smaller holes were never in `empty`
+        sizes = ndimage.sum(np.ones_like(lab), lab, range(1, n + 1)) * step * step / 1e4
+        keep |= np.isin(lab, 1 + np.flatnonzero(sizes < NOISE_HA))
+    keep = ndimage.binary_opening(keep, np.ones((2, 2)))  # no kept slivers one cell (5 m) wide
     if not keep.any():
         return None
     ct = from_origin(x0, y0 + h * PIX, step, step)
@@ -176,10 +173,10 @@ def main():
             continue
         if g.area >= BIG_HA * 1e4:  # blocks of many fields: lone tiny CropScan bits do not keep a field
             ci = g.intersection(cs_big)
-        cut = None if ci.is_empty else straight_cut(g, ci, ci.buffer(EDGE_M).intersection(g))
+        cut = None if ci.is_empty else straight_cut(g, ci)
         if cut is None or cut.is_empty:
             continue
-        if cut.area >= 0.98 * g.area:  # nothing worth cutting -> original boundary
+        if g.area - cut.area < NOISE_HA * 1e4:  # nothing cut -> original boundary
             out.append((g, "esurvey", cv, eid))
         else:
             out.append((cut, "esurvey_clipped", cv, eid))
