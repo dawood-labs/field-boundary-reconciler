@@ -44,9 +44,12 @@ EDGE_M = 8.0  # CropScan sits a few metres inside field edges -> grown by this b
 CUT_MIN_CELLS = 2  # a part is cut off only if it is at least this many cells (20 m) wide ...
 CUT_MIN_HA = 0.25  # ... and at least this big, i.e. a whole field
 ISLAND_HA = 0.15  # in big blocks, lone CropScan bits smaller than this do not keep a field
+PROFILE_MIN = 0.25  # small polygons: a row / column with this much CropScan counts as covered
 SNAP_M = 20.0  # small polygons: a cut closer than this to the polygon edge moves to the edge
 SPILL_OPEN_M = 15.0  # spills narrower than ~30 m are cut off
 SPILL_MIN_HA = 0.2  # smaller spills are cut off
+SPILL_MIN_WIDTH_M = 30.0  # spills narrower than this (rotated box) are cut off
+SPILL_RECT_MIN = 0.65  # spills filling less of their rotated box (wedges, blobs) are cut off
 MIN_PART_HA = 0.05  # output pieces smaller than this are removed
 
 
@@ -75,23 +78,45 @@ def dominant_angle(poly):
 
 
 def box_cut(poly, cs_grown):
-    """Small polygon: keep the rectangle (along the field directions) that holds the CropScan.
+    """Small polygon: keep the band of rows and columns (along the field directions) that hold CropScan.
 
-    Sides of that rectangle closer than SNAP_M to the polygon edge go out to the edge."""
+    Rows / columns count as covered from PROFILE_MIN cover, so stray CropScan bits do not move the cut.
+    Cuts closer than SNAP_M to the polygon edge go out to the edge."""
+    if cs_grown.is_empty:
+        return None
     theta = dominant_angle(poly)
     c = poly.centroid
     rp = affinity.rotate(poly, -theta, origin=c)
     rg = affinity.rotate(cs_grown, -theta, origin=c)
-    if rg.is_empty:
-        return None
-    px0, py0, px1, py1 = rp.bounds
-    x0, y0, x1, y1 = rg.bounds
-    x0 = px0 if x0 - px0 < SNAP_M else x0
-    y0 = py0 if y0 - py0 < SNAP_M else y0
-    x1 = px1 if px1 - x1 < SNAP_M else x1
-    y1 = py1 if py1 - y1 < SNAP_M else y1
-    cut = affinity.rotate(box(x0, y0, x1, y1), theta, origin=c)
+    x0, y0, x1, y1 = rp.bounds
+    w, h = int(np.ceil((x1 - x0) / PIX)), int(np.ceil((y1 - y0) / PIX))
+    t = from_origin(x0, y1, PIX, PIX)
+    pm = rf.rasterize([rp], out_shape=(h, w), transform=t, dtype="uint8")
+    cm = rf.rasterize([rg], out_shape=(h, w), transform=t, dtype="uint8") & pm
+    band = []
+    for axis in (0, 1):  # axis 0 -> columns (x), axis 1 -> rows (y)
+        prof = cm.sum(axis=axis) / np.maximum(pm.sum(axis=axis), 1)
+        idx = np.flatnonzero(prof >= PROFILE_MIN)
+        if not len(idx):
+            return None
+        band.append((idx[0], idx[-1] + 1))
+    (c0, c1), (r0, r1) = band
+    bx0, bx1 = x0 + c0 * PIX, x0 + c1 * PIX
+    by0, by1 = y1 - r1 * PIX, y1 - r0 * PIX
+    bx0 = x0 if bx0 - x0 < SNAP_M else bx0
+    by0 = y0 if by0 - y0 < SNAP_M else by0
+    bx1 = x1 if x1 - bx1 < SNAP_M else bx1
+    by1 = y1 if y1 - by1 < SNAP_M else by1
+    cut = affinity.rotate(box(bx0, by0, bx1, by1), theta, origin=c)
     return shapely.make_valid(cut.intersection(poly))
+
+
+def field_like(g):
+    """Roughly rectangular and at least SPILL_MIN_WIDTH_M wide (drops wedges, triangles, blobs)."""
+    r = shapely.minimum_rotated_rectangle(g)
+    xy = np.asarray(r.exterior.coords)
+    sides = np.hypot(*np.diff(xy[:3], axis=0).T)
+    return sides.min() >= SPILL_MIN_WIDTH_M and g.area / r.area >= SPILL_RECT_MIN
 
 
 def drop_islands(geom, min_area):
@@ -131,6 +156,7 @@ def straight_cut(poly, cs_local, cs_grown):
         empty = np.isin(lab, 1 + np.flatnonzero(sizes >= CUT_MIN_HA))
     empty |= ndimage.binary_dilation(empty, np.ones((3, 3)), iterations=1) & raw_empty  # cut at the real edge
     keep = poly_cells & ~empty
+    keep = ndimage.binary_closing(np.pad(keep, 3), np.ones((3, 3)))[3:-3, 3:-3] & poly_cells  # fill notches up to 30 m
     keep = ndimage.binary_opening(keep, np.ones((CUT_MIN_CELLS, CUT_MIN_CELLS)))  # no thin leftovers
     keep = ndimage.binary_fill_holes(keep)  # never cut out the centre
     if not keep.any():
@@ -212,7 +238,7 @@ def main():
     # square-cornered opening: thin strips go, field corners stay as CropScan drew them
     spill = spill.buffer(-SPILL_OPEN_M, join_style="mitre").buffer(SPILL_OPEN_M, join_style="mitre").intersection(spill)
     for g in shapely.get_parts(spill):
-        if g.area >= SPILL_MIN_HA * 1e4:
+        if g.area >= SPILL_MIN_HA * 1e4 and field_like(g):
             out.append((fill_small_holes(g, HOLE_FILL_HA * 1e4), "cropscan_spill", np.nan, -1))
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
