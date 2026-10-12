@@ -34,15 +34,15 @@ from shapely import affinity
 from shapely.geometry import box
 
 GAP_CLOSE_M = 6.0  # closes CropScan gaps up to ~12 m wide (roads, bunds)
-HOLE_FILL_HA = 0.1  # CropScan holes smaller than this are filled
+HOLE_FILL_HA = 0.02  # only CropScan specks / noise holes (< 200 m2) are filled
 BIG_HA = 5.0  # eSurvey polygons this big are blocks of many fields
 DROP_BELOW = 0.05  # eSurvey coverage below this -> drop
-PIX = 2.0  # pixel size (m) for the cut grid
-CELL = 5  # pixels per cell -> 10 m cells
+PIX = 2.5  # pixel size (m) for the cut grid
+CELL = 2  # pixels per cell -> 5 m cells
 CELL_KEEP = 0.5  # cell coverage to keep a cell
 EDGE_M = 8.0  # CropScan sits a few metres inside field edges -> grown by this before cutting
-CUT_MIN_CELLS = 2  # a part is cut off only if it is at least this many cells (20 m) wide ...
-CUT_MIN_HA = 0.1  # ... and at least this big: any whole field without CropScan is cut, small or big
+CUT_MIN_CELLS = 3  # a part is cut off only if it is at least this many cells (15 m) wide ...
+CUT_MIN_HA = 0.03  # ... and at least this big: any empty field, small or big, inside or on the side
 ISLAND_HA = 0.15  # in big blocks, lone CropScan bits smaller than this do not keep a field
 SPILL_OPEN_M = 7.5  # spills narrower than ~15 m (edge misalignment strips) are cut off
 SPILL_MIN_HA = 0.05  # smaller spills are cut off; anything bigger and wide enough is a field and kept
@@ -120,9 +120,9 @@ def straight_cut(poly, cs_local, cs_grown):
         empty = np.isin(lab, 1 + np.flatnonzero(sizes >= CUT_MIN_HA))
     empty |= ndimage.binary_dilation(empty, np.ones((3, 3)), iterations=1) & raw_empty  # cut at the real edge
     keep = poly_cells & ~empty
-    keep = ndimage.binary_closing(np.pad(keep, 3), np.ones((3, 3)))[3:-3, 3:-3] & poly_cells  # fill notches up to 30 m
+    keep = ndimage.binary_closing(np.pad(keep, 3), np.ones((3, 3)))[3:-3, 3:-3] & poly_cells  # fill notches up to 15 m
     keep = ndimage.binary_opening(keep, np.ones((CUT_MIN_CELLS, CUT_MIN_CELLS)))  # no thin leftovers
-    keep = ndimage.binary_fill_holes(keep)  # never cut out the centre
+    # empty fields inside a block are cut out too (as holes); smaller holes were never in `empty`
     if not keep.any():
         return None
     ct = from_origin(x0, y0 + h * PIX, step, step)
