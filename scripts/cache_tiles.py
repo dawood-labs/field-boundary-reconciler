@@ -2,8 +2,8 @@
 
 Only tiles that touch the given layers (plus a margin) are fetched. Tiles that
 are already on disk are skipped, so a stopped run continues where it left off.
-Tiles are saved as <out>/<zoom>/<x>/<y>.jpg; render_views.py and
-check_spills.py read them from there.
+Tiles are saved as <out>/<zoom>/<x>/<y>.jpg; render_views.py reads them from
+there.
 
 Usage:
     python scripts/cache_tiles.py --layer out/subset/cropscan_subset.parquet \

@@ -1,24 +1,29 @@
-"""Merge CropScan sugarcane with eSurvey field boundaries.
+"""Merge CropScan polygons with eSurvey field boundaries.
 
 Rules
-1. eSurvey polygon (almost) filled by CropScan, ignoring the thin road / bund
-   gaps between fields -> keep the eSurvey polygon as it is.
-2. CropScan with no eSurvey -> keep the CropScan polygon as it is.
-3. eSurvey with no CropScan -> drop.
-4. eSurvey partly covered -> every empty part that is a whole field (small or
-   big) is cut off with straight lines along the field directions; the eSurvey
-   boundary is kept only where it is a few metres off the CropScan edge.
-5. CropScan spilling outside eSurvey -> thin spills are cut off, field-shaped
-   spills are kept as separate polygons.
+1. eSurvey polygon with CropScan -> kept, but every empty part that is a whole
+   field (inside or on the side, small or big) is cut out with straight lines
+   along the field directions. The eSurvey outline is kept where CropScan comes
+   within 5 m of it (edge misalignment); road / bund gaps up to ~10 m between
+   two CropScan fields are kept.
+2. eSurvey with no CropScan -> dropped (CropScan proves the crop).
+3. CropScan with no eSurvey -> kept exactly as it is (original geometry).
+4. CropScan reaching outside eSurvey -> the outside part is kept, except thin
+   edge misalignment strips; small pieces get a size class for review.
 
-Inputs are the cached GeoParquet files in a metric CRS (see README).
+Every polygon gets a `category`, `area_ac` (acres, 3 decimals) and the ids of
+the eSurvey (`es_id`) and CropScan (`cs_id`) polygons it comes from.
+
+Each eSurvey and CropScan polygon is processed in its own small window, in
+parallel on every core, so run time grows linearly with the area.
 
 Usage:
     python scripts/merge_esurvey_cropscan.py --cropscan data/cache/cropscan_utm.parquet \
-        --esurvey data/cache/esurvey_utm.parquet --out out/merged.gpkg \
-        [--aoi minlon minlat maxlon maxlat]
+        --esurvey data/cache/esurvey_utm.parquet --cropscan-original <cropscan.shp> \
+        --out out/merged.gpkg [--aoi minlon minlat maxlon maxlat] [--workers N]
 """
 import argparse
+import multiprocessing
 import os
 import resource
 import time
@@ -29,6 +34,8 @@ import pyogrio
 import pandas as pd
 import rasterio.features as rf
 import shapely
+from concurrent.futures import ProcessPoolExecutor
+
 from rasterio.transform import from_origin
 from scipy import ndimage
 from shapely import affinity
@@ -47,7 +54,7 @@ ISLAND_HA = 0.02  # in big blocks, only CropScan specks (< 200 m2) are ignored; 
 SPILL_OPEN_M = 4.0  # only edge misalignment strips (< ~8 m wide) along eSurvey are cut off
 SPILL_MIN_HA = 0.01  # CropScan outside eSurvey is kept as it is, only specks are removed
 SPILL_MIN_WIDTH_M = 8.0  # thinner pieces are misalignment strips
-SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
+SPILL_RECT_MIN = 0.0  # no shape filter: CropScan outside eSurvey is kept as CropScan drew it
 M2_PER_ACRE = 4046.8564224
 SMALL_CLASSES = [  # (upper limit in acres, category) for small CropScan pieces left beside eSurvey
     (0.10, "cropscan_small_lt_0.10ac"),
@@ -141,6 +148,73 @@ def straight_cut(poly, cs_local):
     return shapely.make_valid(cut.intersection(poly))
 
 
+WINDOW_M = 30.0  # CropScan context around each eSurvey polygon (> 2 x GAP_CLOSE_M)
+_CS = _CS_TREE = _ES = _ES_TREE = None  # set in main(), inherited by forked workers
+
+
+def _snap(g, snap):
+    """Inputs snapped to a 1 mm grid; used only when GEOS fails on a rare near-coincident edge."""
+    return shapely.make_valid(shapely.set_precision(g, 0.001)) if snap else g
+
+
+def _robust(fn, i):
+    try:
+        return fn(i)
+    except shapely.errors.GEOSException:
+        return fn(i, snap=True)
+
+
+def _esurvey_job(idx):
+    return [r for i in idx for r in _robust(_esurvey_job_one, i)]
+
+
+def _esurvey_job_one(i, snap=False):
+    """Decide one eSurvey polygon from the CropScan in a window around it."""
+    rows = []
+    g = _snap(_ES[i], snap)
+    win = g.buffer(WINDOW_M)
+    near = _CS_TREE.query(win, predicate="intersects")
+    if not len(near):
+        return rows
+    local = fill_small_holes(shapely.union_all(shapely.intersection(_snap(_CS[near], snap), win)), HOLE_FILL_HA * 1e4)
+    ci = g.intersection(local.buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M))  # road / bund gaps bridged
+    cv = ci.area / g.area
+    if cv <= DROP_BELOW:
+        return rows
+    if g.area >= BIG_HA * 1e4:  # blocks of many fields: lone CropScan specks do not keep a field
+        ci = g.intersection(drop_islands(local, ISLAND_HA * 1e4).buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M))
+    cut = None if ci.is_empty else straight_cut(g, ci)
+    if cut is None or cut.is_empty:
+        return rows
+    if g.area - cut.area < NOISE_HA * 1e4:  # nothing cut -> original boundary
+        rows.append((g, "esurvey", cv, i))
+    else:
+        rows.append((cut, "esurvey_clipped", cv, i))
+    return rows
+
+
+def _cropscan_job(idx):
+    return [r for i in idx for r in _robust(_cropscan_job_one, i)]
+
+
+def _cropscan_job_one(i, snap=False):
+    """CropScan with no eSurvey stays as it is; the part of other CropScan outside eSurvey is kept
+    when wider than the edge misalignment strips."""
+    rows = []
+    g = _snap(_CS[i], snap) if snap else _CS[i]
+    near = _ES_TREE.query(g, predicate="intersects")
+    if not len(near):
+        rows.append((g, "cropscan", i))
+        return rows
+    spill = g.difference(shapely.union_all(_snap(_ES[near], snap)))
+    # square-cornered opening: thin strips go, field corners stay as CropScan drew them
+    spill = spill.buffer(-SPILL_OPEN_M, join_style="mitre").buffer(SPILL_OPEN_M, join_style="mitre").intersection(spill)
+    for part in shapely.get_parts(spill):
+        if part.geom_type == "Polygon" and part.area >= SPILL_MIN_HA * 1e4 and field_like(part):
+            rows.append((fill_small_holes(part, HOLE_FILL_HA * 1e4), "cropscan_spill", i))
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cropscan", required=True)
@@ -148,6 +222,7 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--cropscan-original", help="original CropScan file (row order = cropscan ids); "
                    "untouched CropScan polygons are written with its exact geometry")
+    p.add_argument("--workers", type=int, help="processes (default: all cores)")
     p.add_argument("--aoi", nargs=4, type=float, help="minlon minlat maxlon maxlat")
     a = p.parse_args()
     t0 = time.time()
@@ -169,47 +244,21 @@ def main():
         aoi = None
     print(f"loaded cs {len(cs)}  es {len(es)}  {time.time() - t0:.1f}s")
 
-    # CropScan cleaned (small holes filled) and closed (road / bund gaps bridged)
-    cs_raw = shapely.union_all(cs.geometry.values)
-    cs_clean = fill_small_holes(cs_raw, HOLE_FILL_HA * 1e4)
-    cs_closed = cs_clean.buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M)
-    shapely.prepare(cs_closed)
-    # for big blocks: lone small CropScan polygons are removed before the gaps are closed
-    cs_big = drop_islands(cs_clean, ISLAND_HA * 1e4).buffer(GAP_CLOSE_M).buffer(-GAP_CLOSE_M)
-    print(f"cropscan cleaned  {time.time() - t0:.1f}s")
-
-    # eSurvey decisions
+    # each eSurvey polygon and each CropScan polygon is worked on in its own small window,
+    # in parallel on every core (forked workers share the inputs read-only)
+    global _CS, _CS_TREE, _ES, _ES_TREE
+    _CS, _ES = cs.geometry.values, es.geometry.values
+    _CS_TREE, _ES_TREE = shapely.STRtree(_CS), shapely.STRtree(_ES)
+    workers = a.workers or os.cpu_count()
+    ctx = multiprocessing.get_context("fork")
     out = []
-    es_geoms = es.geometry.values
-    inter = shapely.intersection(es_geoms, cs_closed)
-    cov = shapely.area(inter) / shapely.area(es_geoms)
-    for eid, g, cv, ci in zip(es.index, es_geoms, cov, inter):
-        if cv < DROP_BELOW:
-            continue
-        if g.area >= BIG_HA * 1e4:  # blocks of many fields: lone tiny CropScan bits do not keep a field
-            ci = g.intersection(cs_big)
-        cut = None if ci.is_empty else straight_cut(g, ci)
-        if cut is None or cut.is_empty:
-            continue
-        if g.area - cut.area < NOISE_HA * 1e4:  # nothing cut -> original boundary
-            out.append((g, "esurvey", cv, eid, -1))
-        else:
-            out.append((cut, "esurvey_clipped", cv, eid, -1))
-    print(f"esurvey decided  {time.time() - t0:.1f}s")
-
-    # CropScan outside eSurvey: whole polygons with no eSurvey stay as they are,
-    # spills from polygons that touch eSurvey are kept only when field-shaped
-    es_all = shapely.union_all(es_geoms)
-    shapely.prepare(es_all)
-    touches = shapely.intersects(cs.geometry.values, es_all)
-    for cid, g in zip(cs.index[~touches], cs.geometry.values[~touches]):
-        out.append((g, "cropscan", np.nan, -1, cid))  # untouched: replaced by the original geometry on write
-    spill = shapely.difference(shapely.union_all(cs.geometry.values[touches]), es_all)
-    # square-cornered opening: thin strips go, field corners stay as CropScan drew them
-    spill = spill.buffer(-SPILL_OPEN_M, join_style="mitre").buffer(SPILL_OPEN_M, join_style="mitre").intersection(spill)
-    for g in shapely.get_parts(spill):
-        if g.area >= SPILL_MIN_HA * 1e4 and field_like(g):
-            out.append((fill_small_holes(g, HOLE_FILL_HA * 1e4), "cropscan_spill", np.nan, -1, -1))
+    with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
+        order = np.argsort(-shapely.area(_ES))  # biggest first, for even load
+        for rows in pool.map(_esurvey_job, np.array_split(order, workers * 16)):
+            out += [(g, src, cv, es.index[i], -1) for g, src, cv, i in rows]
+        print(f"esurvey decided  {time.time() - t0:.1f}s")
+        for rows in pool.map(_cropscan_job, np.array_split(np.arange(len(_CS)), workers * 16)):
+            out += [(g, src, np.nan, -1, cs.index[i] if src == "cropscan" else -1) for g, src, i in rows]
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
     res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id", "orig_cs"], crs=crs)
