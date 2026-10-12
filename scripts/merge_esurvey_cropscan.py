@@ -49,7 +49,7 @@ SPILL_MIN_HA = 0.01  # CropScan outside eSurvey is kept as it is, only specks ar
 SPILL_MIN_WIDTH_M = 8.0  # thinner pieces are misalignment strips
 SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
 M2_PER_ACRE = 4046.8564224
-REVIEW_MAX_AC = 0.3  # CropScan pieces beside eSurvey smaller than this get category cropscan_small_clipped
+REVIEW_MAX_AC = 0.15  # CropScan pieces beside eSurvey smaller than this get category cropscan_small_clipped
 CATEGORY = {
     "esurvey": "esurvey_full",  # eSurvey polygon kept as it is
     "esurvey_clipped": "esurvey_clipped",  # eSurvey polygon cut to the CropScan fields
