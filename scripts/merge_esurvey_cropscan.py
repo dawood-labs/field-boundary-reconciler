@@ -36,18 +36,18 @@ from shapely.geometry import box
 GAP_CLOSE_M = 6.0  # closes CropScan gaps up to ~12 m wide (roads, bunds)
 HOLE_FILL_HA = 0.02  # only CropScan specks / noise holes (< 200 m2) are filled
 BIG_HA = 5.0  # eSurvey polygons this big are blocks of many fields
-DROP_BELOW = 0.05  # eSurvey coverage below this -> drop
+DROP_BELOW = 0.0  # no coverage cut-off: any eSurvey with a real CropScan field is cut and kept
 PIX = 2.5  # pixel size (m) for the cut grid
 CELL = 2  # pixels per cell -> 5 m cells
 CELL_KEEP = 0.5  # cell coverage to keep a cell
 TOL_CELLS = 1  # eSurvey kept up to this many cells (5 m) from CropScan
 NOISE_HA = 0.01  # empty specks smaller than this are not cut
-ISLAND_HA = 0.15  # in big blocks, lone CropScan bits smaller than this do not keep a field
-SPILL_OPEN_M = 7.5  # spills narrower than ~15 m (edge misalignment strips) are cut off
-SPILL_MIN_HA = 0.05  # smaller spills are cut off; anything bigger and wide enough is a field and kept
-SPILL_MIN_WIDTH_M = 15.0  # spills narrower than this (rotated box) are cut off
+ISLAND_HA = 0.02  # in big blocks, only CropScan specks (< 200 m2) are ignored; every real field is kept
+SPILL_OPEN_M = 4.0  # only edge misalignment strips (< ~8 m wide) along eSurvey are cut off
+SPILL_MIN_HA = 0.01  # CropScan outside eSurvey is kept as it is, only specks are removed
+SPILL_MIN_WIDTH_M = 8.0  # thinner pieces are misalignment strips
 SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
-MIN_PART_HA = 0.05  # output pieces smaller than this are removed
+MIN_PART_HA = 0.01  # output pieces smaller than this are removed
 
 
 def fill_small_holes(geom, max_area):
