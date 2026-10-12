@@ -9,7 +9,8 @@ Rules
 2. eSurvey with no CropScan -> dropped (CropScan proves the crop).
 3. CropScan with no eSurvey -> kept exactly as it is (original geometry).
 4. CropScan reaching outside eSurvey -> the outside part is kept, except thin
-   edge misalignment strips; small pieces get a size class for review.
+   edge misalignment strips; small pieces and pieces of huge CropScan polygons
+   get review categories.
 
 Every polygon gets a `category`, `area_ac` (acres, 3 decimals) and the ids of
 the eSurvey (`es_id`) and CropScan (`cs_id`) polygons it comes from.
@@ -20,12 +21,15 @@ parallel on every core, so run time grows linearly with the area.
 Usage:
     python scripts/merge_esurvey_cropscan.py --cropscan data/cache/cropscan_utm.parquet \
         --esurvey data/cache/esurvey_utm.parquet --cropscan-original <cropscan.shp> \
-        --out out/merged.gpkg [--aoi minlon minlat maxlon maxlat] [--workers N]
+        --out out/<aoi>/v1/result.parquet [--gpkg] [--aoi minlon minlat maxlon maxlat] [--workers N]
 """
 import argparse
+import hashlib
 import multiprocessing
 import os
+import pickle
 import resource
+import shutil
 import time
 
 import geopandas as gpd
@@ -43,8 +47,8 @@ from shapely.geometry import box
 
 GAP_CLOSE_M = 6.0  # closes CropScan gaps up to ~12 m wide (roads, bunds)
 QUAD_SEGS = 16  # segments per quarter circle in the gap-closing buffers
-HOLE_FILL_HA = 0.02  # only CropScan specks / noise holes (< 200 m2) are filled
 BIG_HA = 5.0  # eSurvey polygons this big are blocks of many fields
+HOLE_FILL_HA = 0.02  # only CropScan specks / noise holes (< 200 m2) are filled
 DROP_BELOW = 0.0  # no coverage cut-off: any eSurvey with a real CropScan field is cut and kept
 PIX = 2.5  # pixel size (m) for the cut grid
 CELL = 2  # pixels per cell -> 5 m cells
@@ -62,6 +66,7 @@ SMALL_CLASSES = [  # (upper limit in acres, category) for small CropScan pieces 
     (0.15, "cropscan_small_0.10_0.15ac"),
     (0.20, "cropscan_small_0.15_0.20ac"),
 ]
+LARGE_CS_AC = 250.0  # CropScan polygons bigger than this (acres) are reviewed where they reach outside eSurvey
 CATEGORY = {
     "esurvey": "esurvey_full",  # eSurvey polygon kept as it is
     "esurvey_clipped": "esurvey_clipped",  # eSurvey polygon cut to the CropScan fields
@@ -232,13 +237,53 @@ def _cropscan_job_one(i, snap=False):
     return rows
 
 
+ES_GROUP = 500  # eSurvey polygons per saved group
+CS_GROUP = 4000  # CropScan polygons per saved group
+
+
+def run_key(paths):
+    """Fingerprint of the inputs and this script; saved groups are reused only while it is unchanged."""
+    h = hashlib.sha1()
+    for path in paths:
+        st = os.stat(path)
+        h.update(f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}".encode())
+    return h.hexdigest()
+
+
+def open_parts(parts):
+    try:
+        with open(os.path.join(parts, "KEY")) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def atomic_write(path, data):
+    with open(path + ".tmp", "wb") as f:
+        f.write(data)
+    os.replace(path + ".tmp", path)
+
+
+def checkpoint(parts, name, compute):
+    """Rows of one group: read from disk if this group finished before, else computed and saved."""
+    path = os.path.join(parts, name + ".pkl")
+    if os.path.exists(path):
+        print(f"  reused saved group {name}")
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    rows = compute()
+    atomic_write(path, pickle.dumps(rows, protocol=5))
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cropscan", required=True)
     p.add_argument("--esurvey", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--cropscan-original", help="original CropScan file (row order = cropscan ids); "
-                   "untouched CropScan polygons are written with its exact geometry")
+    p.add_argument("--out", required=True, help="result GeoParquet (EPSG:4326), e.g. out/<aoi>/v1/result.parquet")
+    p.add_argument("--cropscan-original", help="cropscan_original.parquet from prepare_inputs.py (or the original "
+                   "CropScan file); untouched CropScan polygons are written with its exact geometry")
+    p.add_argument("--gpkg", action="store_true", help="also write a GeoPackage next to the GeoParquet")
     p.add_argument("--workers", type=int, help="processes (default: all cores)")
     p.add_argument("--aoi", nargs=4, type=float, help="minlon minlat maxlon maxlat")
     a = p.parse_args()
@@ -249,6 +294,7 @@ def main():
     # subsets carry the original ids in a column, keep them as the index
     cs = cs.set_index("cropscan_id") if "cropscan_id" in cs else cs
     es = es.set_index("esurvey_id") if "esurvey_id" in es else es
+    es_field = es["esurvey_Id"] if "esurvey_Id" in es else None  # the eSurvey's own id, if the input has one
     cs, es = cs[["geometry"]], es[["geometry"]]
     crs = cs.crs
     if a.aoi:
@@ -268,15 +314,33 @@ def main():
     _CS_TREE, _ES_TREE = shapely.STRtree(_CS), shapely.STRtree(_ES)
     workers = a.workers or os.cpu_count()
     ctx = multiprocessing.get_context("fork")
+    # results are saved group by group, so a stopped run (e.g. a reclaimed spot machine) goes on
+    # from the last finished group; the folder is reset when the inputs or this script change
+    parts = os.path.splitext(a.out)[0] + "_parts"
+    key = run_key([a.cropscan, a.esurvey, __file__])
+    if open_parts(parts) != key:
+        shutil.rmtree(parts, ignore_errors=True)
+        os.makedirs(parts)
+        atomic_write(os.path.join(parts, "KEY"), key.encode())
     out = []
     with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
-        # biggest polygons first, handed out a few at a time, so no worker is left with all the big ones
-        order = np.argsort(-shapely.area(_ES))
-        for rows in pool.map(_esurvey_job, [order[k:k + 4] for k in range(0, len(order), 4)]):
+        # biggest polygons first, one per task, so no worker is left with all the big ones; each saved
+        # group mixes big and small polygons (every n-th of the size order), so groups take about the
+        # same time and a stopped run loses at most one group
+        order = np.argsort(-shapely.area(_ES), kind="stable")
+        n = -(-len(order) // ES_GROUP)
+        for k in range(n):
+            grp = order[k::n]
+            rows = checkpoint(parts, f"es_{k:05d}", lambda: [r for b in pool.map(
+                _esurvey_job, [grp[j:j + 1] for j in range(len(grp))]) for r in b])
             out += [(g, src, cv, es.index[i], cs.index[c] if c >= 0 else -1) for g, src, cv, i, c in rows]
         print(f"esurvey decided  {time.time() - t0:.1f}s")
-        order = np.argsort(-shapely.get_num_coordinates(_CS))
-        for rows in pool.map(_cropscan_job, [order[k:k + 16] for k in range(0, len(order), 16)]):
+        order = np.argsort(-shapely.get_num_coordinates(_CS), kind="stable")
+        n = -(-len(order) // CS_GROUP)
+        for k in range(n):
+            grp = order[k::n]
+            rows = checkpoint(parts, f"cs_{k:05d}", lambda: [r for b in pool.map(
+                _cropscan_job, [grp[j:j + 16] for j in range(0, len(grp), 16)]) for r in b])
             out += [(g, src, np.nan, -1, cs.index[c]) for g, src, i, c in rows]
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
@@ -298,21 +362,37 @@ def main():
     spill = res.source == "cropscan_spill"
     for upper, name in SMALL_CLASSES[::-1]:
         cat = cat.where(~(spill & (res.area_ac < upper)), name)
+    # CropScan outside eSurvey that comes from a very large CropScan polygon: kept, but flagged for review
+    big_cs = cs.index[shapely.area(cs.geometry.values) / M2_PER_ACRE > LARGE_CS_AC]
+    cat = cat.where(~(res.source.isin(["cropscan", "cropscan_spill"]) & res.cs_id.isin(big_cs)), "cropscan_large_review")
     res["category"] = cat
+    if es_field is not None:
+        res.insert(res.columns.get_loc("es_id") + 1, "esurvey_Id", res.es_id.map(es_field).where(res.es_id >= 0))
     print(f"attributes  {time.time() - t0:.1f}s")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    res.to_parquet(os.path.splitext(a.out)[0] + ".parquet")
     out4326 = res.to_crs(4326)
     if a.cropscan_original:  # untouched CropScan: the exact original geometry, every vertex as delivered
         keep = out4326.index[out4326.source == "cropscan"]
+        # only polygons that are still whole (same area as the CropScan polygon) get the original geometry
+        cs_area = pd.Series(shapely.area(cs.geometry.values), index=cs.index).groupby(level=0).sum()
+        whole = np.isclose(res.area[keep].to_numpy(), cs_area.loc[out4326.cs_id[keep]].to_numpy(), rtol=1e-6)
+        keep = keep[whole]
         ids = out4326.cs_id[keep].to_numpy()
-        orig = pyogrio.read_dataframe(a.cropscan_original, fids=ids, columns=[])
-        same = np.isclose(orig.to_crs(crs).area.to_numpy(), res.area[keep].to_numpy(), rtol=1e-6)
-        out4326.loc[keep[same], "geometry"] = orig.geometry.values[same]  # parts cut by an AOI stay cut
-        print(f"original geometry restored for {same.sum()} of {len(keep)} untouched CropScan polygons")
+        if a.cropscan_original.endswith(".parquet"):  # written by prepare_inputs.py, indexed by feature id
+            orig = gpd.read_parquet(a.cropscan_original).loc[ids]
+        else:  # the original shapefile itself (slow for many polygons)
+            orig = pyogrio.read_dataframe(a.cropscan_original, fids=ids, columns=[])
+        out4326.loc[keep, "geometry"] = orig.geometry.values
+        print(f"original geometry restored for {len(keep)} CropScan polygons kept whole")
     print(f"originals restored  {time.time() - t0:.1f}s")
-    out4326.to_file(a.out, driver="GPKG", engine="pyogrio")
+    # delivery file: GeoParquet, EPSG:4326 (fast to write and read; QGIS opens it directly)
+    out4326.to_parquet(a.out + ".tmp")
+    os.replace(a.out + ".tmp", a.out)  # a stopped run never leaves a half-written result
+    if a.gpkg:
+        gp = os.path.splitext(a.out)[0] + ".gpkg"
+        out4326.to_file(gp + ".tmp", driver="GPKG", engine="pyogrio")
+        os.replace(gp + ".tmp", gp)
     print(res.groupby("source").area_ac.agg(["count", "sum"]).round(1))
     print(res.groupby("category").area_ac.agg(["count", "sum"]).round(1))
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6

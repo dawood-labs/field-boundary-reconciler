@@ -95,6 +95,8 @@ def main():
             col, val = flt.split("=")
             g = g[g[col].astype(str) == val]
         g = g[["geometry"]].reset_index(drop=True)
+        if layers and g.crs != layers[0][1].crs:  # all layers in the CRS of the first one
+            g = g.to_crs(layers[0][1].crs)
         layers.append((name, g, color))
 
     views = pd.read_csv(a.views)

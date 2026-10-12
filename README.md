@@ -5,6 +5,8 @@ field boundaries (eSurvey). Where both exist, the output keeps the surveyed
 boundary but cuts away every field that has no detected crop. Where only the
 model found the crop, the model polygon is kept exactly as it is.
 
+Detailed explanation of every step (what, why and how): [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
+
 ## Rules
 
 | Case | Output | `category` |
@@ -15,9 +17,11 @@ model found the crop, the model polygon is kept exactly as it is.
 | CropScan polygon with no eSurvey | original CropScan geometry, unchanged (same vertices) | `cropscan_original` |
 | Part of a CropScan polygon outside eSurvey | kept, except edge misalignment strips narrower than ~8 m | `cropscan_clipped` |
 | Same, but smaller than 0.20 acres | kept, flagged by size for review | `cropscan_small_lt_0.10ac`, `cropscan_small_0.10_0.15ac`, `cropscan_small_0.15_0.20ac` |
+| CropScan outside eSurvey that comes from a CropScan polygon larger than 250 acres | kept, flagged for review | `cropscan_large_review` |
 
 Output fields: `fid`, `predicted` (1 = Sugarcane), `source`, `category`,
 `es_cover` (share of the eSurvey polygon covered by CropScan), `es_id`,
+`esurvey_Id` (the eSurvey's own `Id` field, when the input has one),
 `cs_id` (row number of the source polygons, -1 if none), `area_ac`
 (acres, 3 decimals).
 
@@ -47,11 +51,15 @@ All paths below are examples; keep data, outputs and credentials out of git
    unzip data/raw/<esurvey>.zip -d data/extracted/esurvey
    ```
 
-2. **Prepare the inputs** (UTM GeoParquet, eSurvey split into single polygons and repaired):
+   Inputs on S3 instead: `aws s3 sync s3://<bucket>/<prefix>/ data/s3_input/` (only missing or
+   changed files are fetched, so it can simply be run again).
+
+2. **Prepare the inputs** (UTM GeoParquet, eSurvey split into single polygons and repaired),
+   optionally for one AOI (polygons inside it by an interior point; nothing is cut at the AOI line):
 
    ```bash
-   python scripts/prepare_inputs.py --cropscan data/extracted/cropscan/<cropscan>.shp \
-       --esurvey data/extracted/esurvey/<esurvey>.shp --out data/cache
+   python scripts/prepare_inputs.py --cropscan <cropscan.shp> --esurvey <esurvey.shp> \
+       --aoi <aoi.shp> --out data/cache/<aoi_name>
    ```
 
 3. **Optional: make a small test area** to try rule changes quickly:
@@ -64,25 +72,38 @@ All paths below are examples; keep data, outputs and credentials out of git
 4. **Merge**:
 
    ```bash
-   python scripts/merge_esurvey_cropscan.py --cropscan data/cache/cropscan_utm.parquet \
-       --esurvey data/cache/esurvey_utm.parquet \
-       --cropscan-original data/extracted/cropscan/<cropscan>.shp \
-       --out out/v1/result.gpkg
+   python scripts/merge_esurvey_cropscan.py --cropscan data/cache/<aoi_name>/cropscan_utm.parquet \
+       --esurvey data/cache/<aoi_name>/esurvey_utm.parquet \
+       --cropscan-original data/cache/<aoi_name>/cropscan_original.parquet \
+       --out out/<aoi_name>/v1/result.parquet
    ```
 
-   Writes `result.gpkg` (EPSG:4326, for delivery and QGIS) and `result.parquet`
-   (UTM, for checks). Write every run to a new folder so a file open in QGIS is
-   never overwritten. On a subset, pass the subset files and the same
-   `--cropscan-original`.
+   Writes `result.parquet`, a GeoParquet in EPSG:4326 (fast; QGIS opens it
+   directly); add `--gpkg` for a GeoPackage as well. Write every run to a new
+   folder so a file open in QGIS is never overwritten.
 
-5. **QA on the satellite basemap** (optional):
+   **Resumable:** results are saved in small groups under `result_parts/`. If the
+   machine stops (e.g. a reclaimed spot instance), run the same command again: it
+   reuses the finished groups and only computes the rest. The saved groups are
+   discarded automatically when the inputs or the script change. Final files are
+   written under a temporary name and renamed, so a stop never leaves a broken file.
+
+5. **Upload the final outputs** to Google Cloud Storage (skips files already there
+   with the same size; verifies every file by size):
 
    ```bash
-   python scripts/cache_tiles.py --layer data/cache/esurvey_utm.parquet --out data/tiles --zoom 18
+   python scripts/upload_outputs.py --key <service_account.json> --bucket <bucket> \
+       --prefix <prefix/> out/<aoi_name>/v1/result.parquet
+   ```
+
+6. **QA on the satellite basemap** (optional):
+
+   ```bash
+   python scripts/cache_tiles.py --layer data/cache/<aoi_name>/esurvey_utm.parquet --out data/tiles --zoom 18
    python scripts/render_views.py --views views.csv --out qa/views \
-       --layer cropscan_in=data/cache/cropscan_utm.parquet:yellow \
-       --layer esurvey_in=data/cache/esurvey_utm.parquet:red \
-       --layer "out_clipped=out/v1/result.parquet?source=esurvey_clipped:magenta"
+       --layer cropscan_in=data/cache/<aoi_name>/cropscan_utm.parquet:yellow \
+       --layer esurvey_in=data/cache/<aoi_name>/esurvey_utm.parquet:red \
+       --layer "out_clipped=out/<aoi_name>/v1/result.parquet?source=esurvey_clipped:magenta"
    ```
 
    `views.csv` has the columns `name,lat,lon,half_m`. Tiles are cached on disk,
