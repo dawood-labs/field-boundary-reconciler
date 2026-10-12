@@ -49,7 +49,11 @@ SPILL_MIN_HA = 0.01  # CropScan outside eSurvey is kept as it is, only specks ar
 SPILL_MIN_WIDTH_M = 8.0  # thinner pieces are misalignment strips
 SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
 M2_PER_ACRE = 4046.8564224
-REVIEW_MAX_AC = 0.15  # CropScan pieces beside eSurvey smaller than this get category cropscan_small_clipped
+SMALL_CLASSES = [  # (upper limit in acres, category) for small CropScan pieces left beside eSurvey
+    (0.10, "cropscan_small_lt_0.10ac"),
+    (0.15, "cropscan_small_0.10_0.15ac"),
+    (0.20, "cropscan_small_0.15_0.20ac"),
+]
 CATEGORY = {
     "esurvey": "esurvey_full",  # eSurvey polygon kept as it is
     "esurvey_clipped": "esurvey_clipped",  # eSurvey polygon cut to the CropScan fields
@@ -231,8 +235,11 @@ def main():
     # review flag: small or narrow CropScan pieces left beside eSurvey after the clip
     # category: one class per polygon, for styling and review
     cat = res.source.map(CATEGORY)
-    small = (res.source == "cropscan_spill") & (res.area_ac < REVIEW_MAX_AC)  # big clipped fields are not flagged
-    res["category"] = np.where(small, "cropscan_small_clipped", cat)
+    # small CropScan pieces beside eSurvey get a size class; bigger clipped fields keep cropscan_clipped
+    spill = res.source == "cropscan_spill"
+    for upper, name in SMALL_CLASSES[::-1]:
+        cat = cat.where(~(spill & (res.area_ac < upper)), name)
+    res["category"] = cat
     res = res.drop(columns="orig_cs")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
