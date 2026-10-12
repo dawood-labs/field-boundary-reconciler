@@ -25,6 +25,7 @@ import time
 
 import geopandas as gpd
 import numpy as np
+import pyogrio
 import pandas as pd
 import rasterio.features as rf
 import shapely
@@ -47,6 +48,14 @@ SPILL_OPEN_M = 4.0  # only edge misalignment strips (< ~8 m wide) along eSurvey 
 SPILL_MIN_HA = 0.01  # CropScan outside eSurvey is kept as it is, only specks are removed
 SPILL_MIN_WIDTH_M = 8.0  # thinner pieces are misalignment strips
 SPILL_RECT_MIN = 0.0  # shape and basemap checks are done later by check_spills.py
+M2_PER_ACRE = 4046.8564224
+REVIEW_MAX_AC = 0.3  # CropScan pieces beside eSurvey smaller than this get category cropscan_small_clipped
+CATEGORY = {
+    "esurvey": "esurvey_full",  # eSurvey polygon kept as it is
+    "esurvey_clipped": "esurvey_clipped",  # eSurvey polygon cut to the CropScan fields
+    "cropscan": "cropscan_original",  # CropScan with no eSurvey, original geometry
+    "cropscan_spill": "cropscan_clipped",  # CropScan field outside eSurvey, cut at the eSurvey edge
+}
 MIN_PART_HA = 0.01  # output pieces smaller than this are removed
 
 
@@ -133,6 +142,8 @@ def main():
     p.add_argument("--cropscan", required=True)
     p.add_argument("--esurvey", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--cropscan-original", help="original CropScan file (row order = cropscan ids); "
+                   "untouched CropScan polygons are written with its exact geometry")
     p.add_argument("--aoi", nargs=4, type=float, help="minlon minlat maxlon maxlat")
     a = p.parse_args()
     t0 = time.time()
@@ -177,9 +188,9 @@ def main():
         if cut is None or cut.is_empty:
             continue
         if g.area - cut.area < NOISE_HA * 1e4:  # nothing cut -> original boundary
-            out.append((g, "esurvey", cv, eid))
+            out.append((g, "esurvey", cv, eid, -1))
         else:
-            out.append((cut, "esurvey_clipped", cv, eid))
+            out.append((cut, "esurvey_clipped", cv, eid, -1))
     print(f"esurvey decided  {time.time() - t0:.1f}s")
 
     # CropScan outside eSurvey: whole polygons with no eSurvey stay as they are,
@@ -187,22 +198,23 @@ def main():
     es_all = shapely.union_all(es_geoms)
     shapely.prepare(es_all)
     touches = shapely.intersects(cs.geometry.values, es_all)
-    for g in cs.geometry.values[~touches]:
-        out.append((fill_small_holes(g, HOLE_FILL_HA * 1e4), "cropscan", np.nan, -1))
+    for cid, g in zip(cs.index[~touches], cs.geometry.values[~touches]):
+        out.append((g, "cropscan", np.nan, -1, cid))  # untouched: replaced by the original geometry on write
     spill = shapely.difference(shapely.union_all(cs.geometry.values[touches]), es_all)
     # square-cornered opening: thin strips go, field corners stay as CropScan drew them
     spill = spill.buffer(-SPILL_OPEN_M, join_style="mitre").buffer(SPILL_OPEN_M, join_style="mitre").intersection(spill)
     for g in shapely.get_parts(spill):
         if g.area >= SPILL_MIN_HA * 1e4 and field_like(g):
-            out.append((fill_small_holes(g, HOLE_FILL_HA * 1e4), "cropscan_spill", np.nan, -1))
+            out.append((fill_small_holes(g, HOLE_FILL_HA * 1e4), "cropscan_spill", np.nan, -1, -1))
     print(f"cropscan done  {time.time() - t0:.1f}s")
 
-    res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id"], crs=crs)
+    res = gpd.GeoDataFrame(out, columns=["geometry", "source", "es_cover", "es_id", "orig_cs"], crs=crs)
     res = res.explode(index_parts=False)
     res = res[res.geom_type == "Polygon"]
     if aoi is not None:
         res = res[res.intersects(aoi)]
-    res = res[res.area >= MIN_PART_HA * 1e4].reset_index(drop=True)
+    # untouched CropScan is never filtered; new pieces below MIN_PART_HA are dropped
+    res = res[(res.source == "cropscan") | (res.area >= MIN_PART_HA * 1e4)].reset_index(drop=True)
     # cs_id: the CropScan polygon that overlaps each output polygon most (-1 if none)
     cs_ids = cs.index.to_numpy()  # ids can repeat in a subset (one polygon cut into parts)
     cs_pos = cs.reset_index(drop=True)
@@ -213,13 +225,29 @@ def main():
     res.loc[best.index, "cs_id"] = cs_ids[best.to_numpy()]
     res.insert(0, "fid", np.arange(1, len(res) + 1))
     res.insert(1, "predicted", 1)  # Sugarcane
-    res["area_ha"] = (res.area / 1e4).round(4)
+    res.loc[res.source == "cropscan", "cs_id"] = res.orig_cs[res.source == "cropscan"]
     res["es_cover"] = res.es_cover.round(3)
+    res["area_ac"] = (res.area / M2_PER_ACRE).round(3)
+    # review flag: small or narrow CropScan pieces left beside eSurvey after the clip
+    # category: one class per polygon, for styling and review
+    cat = res.source.map(CATEGORY)
+    small = (res.source == "cropscan_spill") & (res.area_ac < REVIEW_MAX_AC)  # big clipped fields are not flagged
+    res["category"] = np.where(small, "cropscan_small_clipped", cat)
+    res = res.drop(columns="orig_cs")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     res.to_parquet(os.path.splitext(a.out)[0] + ".parquet")
-    res.to_crs(4326).to_file(a.out, driver="GPKG", engine="pyogrio")
-    print(res.groupby("source").area_ha.agg(["count", "sum"]).round(1))
+    out4326 = res.to_crs(4326)
+    if a.cropscan_original:  # untouched CropScan: the exact original geometry, every vertex as delivered
+        keep = out4326.index[out4326.source == "cropscan"]
+        ids = out4326.cs_id[keep].to_numpy()
+        orig = pyogrio.read_dataframe(a.cropscan_original, fids=ids, columns=[])
+        same = np.isclose(orig.to_crs(crs).area.to_numpy(), res.area[keep].to_numpy(), rtol=1e-6)
+        out4326.loc[keep[same], "geometry"] = orig.geometry.values[same]  # parts cut by an AOI stay cut
+        print(f"original geometry restored for {same.sum()} of {len(keep)} untouched CropScan polygons")
+    out4326.to_file(a.out, driver="GPKG", engine="pyogrio")
+    print(res.groupby("source").area_ac.agg(["count", "sum"]).round(1))
+    print(res.groupby("category").area_ac.agg(["count", "sum"]).round(1))
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
     print(f"saved {a.out}  {time.time() - t0:.1f}s  peak memory {peak:.1f} GB")
 
